@@ -22,6 +22,8 @@ pub async fn run(listener: TcpListener, db: Db) -> anyhow::Result<()> {
 }
 
 async fn handle_client(socket: TcpStream, db: Db) -> anyhow::Result<()> {
+    // Small request/response messages: don't let Nagle hold replies back.
+    socket.set_nodelay(true)?;
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
 
