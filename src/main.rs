@@ -1,7 +1,7 @@
 use clap::Parser;
 use tokio::net::TcpListener;
 
-use rkv::db::Db;
+use rkv::db::{Db, StoreKind};
 
 #[derive(Parser, Debug)]
 #[command(name = "rkv", about = "A tiny Rust key-value store")]
@@ -9,6 +9,9 @@ struct Args {
     /// Address to listen on
     #[arg(long, default_value = "127.0.0.1:6380")]
     addr: String,
+    /// Storage locking strategy
+    #[arg(long, value_enum, default_value_t = StoreKind::Mutex)]
+    store: StoreKind,
 }
 
 #[tokio::main]
@@ -21,5 +24,6 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let listener = TcpListener::bind(&args.addr).await?;
-    rkv::server::run(listener, Db::new()).await
+    tracing::info!(store = ?args.store, "starting");
+    rkv::server::run(listener, Db::new(args.store)).await
 }
