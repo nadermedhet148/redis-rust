@@ -1,14 +1,19 @@
 # rkv — Performance & Safety
 
 This document covers how rkv is measured and tested for **throughput, CPU, memory,
-and concurrency safety**, and the numbers as of tag `ep02`.
+concurrency safety, and durability**, and what the numbers mean.
+
+The raw output for each episode, with every test result and benchmark table, is
+saved in [`results/`](../results/) (`results/ep03.md`, ...) by
+`scripts/test-report.sh`. This document quotes from those runs.
 
 Everything here is reproducible from the repo:
 
 ```sh
-cargo test --release                                  # all safety / memory / CPU tests
+scripts/test-report.sh                                # all tests + benchmarks -> results/<tag>.md
+cargo test --release                                  # all safety / memory / CPU / crash tests
 cargo test --release -- --nocapture                   # same, printing the measured numbers
-cargo build --release && target/release/rkv-bench --compare   # TCP benchmark table
+cargo build --release && target/release/rkv-bench --compare stores   # TCP benchmark table
 cargo bench --bench store                             # in-memory lock benchmark (criterion)
 ```
 
@@ -32,9 +37,9 @@ benchmark runs against all three.
 
 ## 2. Throughput & latency
 
-### 2a. Over TCP — `rkv-bench --compare`
+### 2a. Over TCP — `rkv-bench --compare stores`
 
-`rkv-bench --compare` starts a separate `rkv` **process** per store (so server
+`rkv-bench --compare stores` starts a separate `rkv` **process** per store (so server
 CPU/memory are measured without the load generator), preloads the key space,
 then runs N clients × M request/response ops.
 
@@ -163,7 +168,8 @@ Why these are the right properties for this design: values are `Bytes`
 (immutable, refcounted), and every map access happens entirely under a lock, so
 a reader can only ever get a pointer to a complete value. These tests check
 that this holds in practice, and they'll keep checking when the storage engine
-changes (WAL in ep03, LSM in ep04).
+changes (LSM in ep04). With the WAL (ep03), the same tests still pass: they
+use in-memory `Db`s, and section 6 covers the WAL itself.
 
 **Not covered yet** (worth adding as the design gets more complex):
 - **loom** model checking: exhaustively explores thread interleavings. More
@@ -173,21 +179,114 @@ changes (WAL in ep03, LSM in ep04).
 
 ---
 
-## 6. Running it yourself
+## 6. Durability — WAL (ep03)
+
+Run with `--wal <path>`. Every SET/DEL is appended to the log before it is
+applied in memory, and the log is replayed on startup.
+
+```text
+record  = len: u32 | crc: u32 | payload[len]          (little-endian)
+payload = op: u8   | key_len: u32 | key | value        op: 1 = SET, 2 = DEL
+```
+
+Design decisions, and why:
+
+- **One `write()` syscall per record, no userspace buffer.** Once `write`
+  returns, the record is in the OS page cache, so it survives the *process*
+  being killed (`kill -9`, panic, OOM-kill) under **every** fsync policy. fsync
+  only matters if the *machine* dies (power loss, kernel panic).
+- **The append happens while holding the key's lock** (the map lock, or the
+  shard lock for `sharded`). Two writes to the same key reach the log in the
+  same order they reach memory, so replay rebuilds exactly the state clients
+  saw. Writes to different shards can be logged in any order, which is fine
+  because they don't affect each other.
+- **Log first, then apply.** If the append fails, memory isn't touched and the
+  client gets `ERR storage: ...`, so the server never acknowledges a write it
+  didn't log.
+- **Replay stops at the first bad record** (cut short, CRC mismatch, length >
+  64 MiB, or undecodable) and **truncates the file there**. Otherwise new
+  records would be appended after garbage and never be read.
+- **The server binds its port only after replay finishes.** A client that can
+  connect sees all recovered data.
+
+### fsync policies — `rkv-bench --compare fsync`
+
+Sharded store, 50 clients × 2,000 ops, 80% GET / 20% SET:
+
+| `--fsync` | ops/sec | p50 (µs) | p99 (µs) | what a power loss can lose |
+|-----------|--------:|---------:|---------:|----------------------------|
+| (no WAL)    |  141863 |      313 |      903 | everything |
+| `never`     |  127708 |      343 |     1034 | whatever the OS hadn't flushed yet (Linux default: up to ~30 s) |
+| `every-sec` |  125483 |      344 |     1083 | up to ~1 s of acknowledged writes |
+| `always`    |   17635 |     1959 |    11056 | nothing that was acknowledged |
+
+- **The WAL itself is cheap**: ~10% for `never` / `every-sec`, i.e. one extra
+  `write` syscall per SET.
+- **`always` is 8× slower, and reads get slower too** (p50 0.3 → 2 ms, even
+  though 80% of ops are GETs). Two reasons, both visible in the code:
+  1. All SETs serialize on the WAL's mutex, and each one holds it through a
+     ~0.3 ms `fsync`, so throughput is capped at roughly 1 / fsync-latency SETs
+     per second.
+  2. The SET also holds its **shard lock** while it waits for the fsync, so
+     GETs on that shard wait for the disk too.
+
+  The standard fix is **group commit**: many writers append, one fsync covers
+  all of them, and everyone gets acknowledged together. Not implemented yet.
+
+### Crash tests — `tests/crash.rs`
+
+These run the real `rkv` binary as a child process and kill it with
+`Child::kill` (SIGKILL on Unix, TerminateProcess on Windows: no cleanup).
+
+| Test | Asserts | Measured |
+|------|---------|----------|
+| `kill9_mid_write_loses_no_acknowledged_write` | For each policy: 8 clients write `k{c}:{i}` in order, the server is killed 300 ms in and restarted on the same WAL. Every write that got `OK` is present; nothing beyond the single in-flight write per client exists. | always: ~1,000 acked writes, every-sec / never: ~20,000; **all recovered** |
+| `deletes_and_overwrites_survive_restart` | SET, overwrite, DEL, values with spaces: replay gives the final state, for each policy. | ✓ |
+| `torn_record_at_tail_is_discarded_on_restart` | Append half a record to the WAL after a kill. The server starts, the file is truncated back to the last good record, all 100 earlier keys are intact, and new writes after recovery survive another kill. | ✓ |
+
+Unit tests in `src/wal.rs` go further on the format: they **cut the last record
+at every byte offset** and **flip every byte of it**; replay must return exactly
+the records before it every time. They also check that a garbage length
+(4 GiB) doesn't allocate, and that appends after a truncation are readable.
+
+**What these tests can't show:** surviving *power loss*. A killed process
+doesn't drop the OS page cache, so all three policies pass the kill -9 test.
+Testing fsync for real needs a VM you can hard-reset, or a fault-injecting
+filesystem (e.g. dm-flakey / LazyFS). That's the difference between the
+policies; the benchmark above shows what each one costs.
+
+**Known limitation:** a corrupt record in the *middle* of the log (bit rot, not
+a crash) is treated like a torn tail: everything after it is dropped, with a
+`WARN` in the log. A stricter design would refuse to start and ask an operator.
+
+**Demo for the video:** `scripts/crash-demo.sh [always|every-sec|never]` writes
+keys, kills the server with `kill -9`, restarts it, then appends a torn record
+by hand and shows replay truncating it.
+
+---
+
+## 7. Running it yourself
 
 ```sh
-# everything, with numbers
+# everything, saved to results/<git describe>.md
+scripts/test-report.sh
+CRITERION=1 scripts/test-report.sh      # also the in-memory criterion bench (~15 min)
+
+# everything, with numbers, to the terminal
 cargo test --release -- --nocapture
 
 # only one area
 cargo test --release --test concurrency
 cargo test --release --test memory -- --nocapture
 cargo test --release --test cpu -- --nocapture
+cargo test --release --test crash -- --nocapture
+cargo test --release --lib wal                           # WAL format unit tests
 
 # benchmarks
 cargo build --release
-target/release/rkv-bench --compare                       # 50 clients x 20k ops, 80% reads
-target/release/rkv-bench --compare -c 100 -n 5000 --read-ratio 0.5
+target/release/rkv-bench --compare stores                # 50 clients x 20k ops, 80% reads
+target/release/rkv-bench --compare fsync -n 2000         # WAL fsync policies
+target/release/rkv-bench --compare stores -c 100 -n 5000 --read-ratio 0.5
 target/release/rkv-bench --addr 127.0.0.1:6380           # against a server you started
 cargo bench --bench store                                # criterion; HTML in target/criterion/
 ```
