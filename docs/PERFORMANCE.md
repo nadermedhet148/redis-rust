@@ -2,6 +2,7 @@
 
 This document covers how rkv is measured and tested for **throughput, CPU, memory,
 concurrency safety, and durability**, and what the numbers mean.
+For how the system itself works, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 The raw output for each episode, with every test result and benchmark table, is
 saved in [`results/`](../results/) (`results/ep03.md`, ...) by
