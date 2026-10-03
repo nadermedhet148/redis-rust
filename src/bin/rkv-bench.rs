@@ -2,18 +2,19 @@
 //!
 //!   cargo run --release --bin rkv-bench -- --addr 127.0.0.1:6380 -c 50 -n 20000
 //!
-//! `--compare` starts its own `rkv` server process once per store kind and
-//! prints one table, including that server process's CPU time and memory.
+//! `--compare` starts its own `rkv` server process per configuration and prints
+//! one table, including that server process's CPU time and memory:
 //!
-//!   cargo build --release && target/release/rkv-bench --compare
+//!   cargo build --release
+//!   target/release/rkv-bench --compare stores   # mutex vs rwlock vs sharded (ep02)
+//!   target/release/rkv-bench --compare fsync    # no WAL vs fsync never/every-sec/always (ep03)
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
-use rkv::db::StoreKind;
+use clap::{Parser, ValueEnum};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -39,9 +40,51 @@ struct Args {
     /// Value size in bytes
     #[arg(long, default_value_t = 64)]
     value_size: usize,
-    /// Spawn an rkv server per store kind and compare them in one table
-    #[arg(long)]
-    compare: bool,
+    /// Spawn an rkv server per configuration and compare them in one table
+    #[arg(long, value_enum)]
+    compare: Option<Compare>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Compare {
+    /// --store mutex | rwlock | sharded, in memory
+    Stores,
+    /// --store sharded with no WAL, then WAL with each --fsync policy
+    Fsync,
+}
+
+/// One row of a comparison: a label and the extra args for `rkv`.
+struct Config {
+    label: &'static str,
+    server_args: Vec<String>,
+    wal: Option<std::path::PathBuf>,
+}
+
+impl Config {
+    fn new(label: &'static str, store: &str, fsync: Option<&str>) -> Self {
+        let mut server_args = vec!["--store".to_string(), store.to_string()];
+        let wal = fsync.map(|policy| {
+            let path =
+                std::env::temp_dir().join(format!("rkv-bench-{}-{label}.wal", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            server_args.extend(["--fsync".into(), policy.into(), "--wal".into()]);
+            server_args.push(path.display().to_string());
+            path
+        });
+        Self {
+            label,
+            server_args,
+            wal,
+        }
+    }
+}
+
+impl Drop for Config {
+    fn drop(&mut self) {
+        if let Some(wal) = &self.wal {
+            let _ = std::fs::remove_file(wal);
+        }
+    }
 }
 
 struct Report {
@@ -73,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         args.value_size
     );
 
-    if !args.compare {
+    let Some(compare) = args.compare else {
         preload(&args).await?;
         let report = run(&args).await?;
         println!("| ops/sec | p50 (us) | p99 (us) |");
@@ -85,20 +128,31 @@ async fn main() -> anyhow::Result<()> {
             report.percentile(0.99)
         );
         return Ok(());
-    }
+    };
+
+    let configs = match compare {
+        Compare::Stores => vec![
+            Config::new("mutex", "mutex", None),
+            Config::new("rwlock", "rwlock", None),
+            Config::new("sharded", "sharded", None),
+        ],
+        Compare::Fsync => vec![
+            Config::new("no WAL", "sharded", None),
+            Config::new("never", "sharded", Some("never")),
+            Config::new("every-sec", "sharded", Some("every-sec")),
+            Config::new("always", "sharded", Some("always")),
+        ],
+    };
 
     println!(
-        "| store   | ops/sec | p50 (us) | p99 (us) | server CPU (cores) | CPU us/op | RSS idle (MB) | RSS peak (MB) |"
+        "| config    | ops/sec | p50 (us) | p99 (us) | server CPU (cores) | CPU us/op | RSS idle (MB) | RSS peak (MB) |"
     );
     println!(
-        "|---------|--------:|---------:|---------:|-------------------:|----------:|--------------:|--------------:|"
+        "|-----------|--------:|---------:|---------:|-------------------:|----------:|--------------:|--------------:|"
     );
-    for (i, kind) in [StoreKind::Mutex, StoreKind::Rwlock, StoreKind::Sharded]
-        .into_iter()
-        .enumerate()
-    {
+    for (i, config) in configs.iter().enumerate() {
         let addr = format!("127.0.0.1:{}", 16380 + i);
-        let server = Server::spawn(&addr, kind).await?;
+        let server = Server::spawn(&addr, &config.server_args).await?;
         let args = Args {
             addr,
             ..args.clone()
@@ -113,8 +167,8 @@ async fn main() -> anyhow::Result<()> {
         let peak_rss = sampler.stop();
 
         println!(
-            "| {:<7} | {:>7.0} | {:>8} | {:>8} | {:>18.2} | {:>9.1} | {:>13.1} | {:>13.1} |",
-            format!("{kind:?}").to_lowercase(),
+            "| {:<9} | {:>7.0} | {:>8} | {:>8} | {:>18.2} | {:>9.1} | {:>13.1} | {:>13.1} |",
+            config.label,
             report.ops_per_sec(),
             report.percentile(0.50),
             report.percentile(0.99),
@@ -139,16 +193,12 @@ struct Server {
 }
 
 impl Server {
-    async fn spawn(addr: &str, kind: StoreKind) -> anyhow::Result<Self> {
+    async fn spawn(addr: &str, server_args: &[String]) -> anyhow::Result<Self> {
         let exe =
             std::env::current_exe()?.with_file_name(format!("rkv{}", std::env::consts::EXE_SUFFIX));
         let child = Command::new(&exe)
-            .args([
-                "--addr",
-                addr,
-                "--store",
-                &format!("{kind:?}").to_lowercase(),
-            ])
+            .args(["--addr", addr])
+            .args(server_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
