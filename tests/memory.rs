@@ -83,7 +83,7 @@ fn fill(db: &Db) -> usize {
     for i in 0..N {
         let k = key(i);
         payload += k.len() + VALUE_LEN;
-        db.set(k, Bytes::from(vec![b'x'; VALUE_LEN]));
+        db.set(k, Bytes::from(vec![b'x'; VALUE_LEN])).unwrap();
     }
     payload
 }
@@ -140,7 +140,7 @@ fn del_frees_keys_and_values() {
         let payload = fill(&db) as isize;
         let full = local();
         for i in 0..N {
-            assert!(db.del(&key(i)));
+            assert!(db.del(&key(i)).unwrap());
         }
         let freed = full - local();
         let retained = local() - base;
@@ -165,7 +165,7 @@ fn overwriting_does_not_grow_memory() {
         let db = Db::new(kind);
         let write_all = || {
             for i in 0..1_000 {
-                db.set(key(i), Bytes::from(vec![b'y'; VALUE_LEN]));
+                db.set(key(i), Bytes::from(vec![b'y'; VALUE_LEN])).unwrap();
             }
         };
         write_all();

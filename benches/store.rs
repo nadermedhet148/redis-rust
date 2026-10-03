@@ -29,7 +29,7 @@ fn mixed_workload(c: &mut Criterion) {
         let db = Db::new(kind);
         let keys: Vec<String> = (0..KEYS).map(|k| format!("key:{k}")).collect();
         for k in &keys {
-            db.set(k.clone(), Bytes::from_static(&[b'x'; 64]));
+            db.set(k.clone(), Bytes::from_static(&[b'x'; 64])).unwrap();
         }
 
         for &t in &threads {
@@ -59,7 +59,7 @@ fn run(db: &Db, keys: &[String], threads: usize, iters: u64) -> Duration {
                     if ((x >> 11) as f64 / (1u64 << 53) as f64) < READ_RATIO {
                         black_box(db.get(key));
                     } else {
-                        db.set(key.clone(), value.clone());
+                        db.set(key.clone(), value.clone()).unwrap();
                     }
                 }
             });

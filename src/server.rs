@@ -1,6 +1,6 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::command::Command;
 use crate::db::Db;
@@ -45,17 +45,21 @@ fn execute(line: &str, db: &Db) -> Vec<u8> {
             Some(value) => value.to_vec(),
             None => b"(nil)".to_vec(),
         },
-        Ok(Command::Set { key, value }) => {
-            db.set(key, value);
-            b"OK".to_vec()
-        }
-        Ok(Command::Del { key }) => {
-            if db.del(&key) {
-                b"1".to_vec()
-            } else {
-                b"0".to_vec()
-            }
-        }
+        Ok(Command::Set { key, value }) => match db.set(key, value) {
+            Ok(()) => b"OK".to_vec(),
+            Err(e) => storage_error(e),
+        },
+        Ok(Command::Del { key }) => match db.del(&key) {
+            Ok(true) => b"1".to_vec(),
+            Ok(false) => b"0".to_vec(),
+            Err(e) => storage_error(e),
+        },
         Err(e) => format!("ERR {e}").into_bytes(),
     }
+}
+
+/// The write was not logged, so it was not applied either: tell the client.
+fn storage_error(e: std::io::Error) -> Vec<u8> {
+    error!(error = %e, "WAL write failed");
+    format!("ERR storage: {e}").into_bytes()
 }

@@ -52,7 +52,8 @@ fn no_lost_writes_across_threads() {
                 let db = db.clone();
                 s.spawn(move || {
                     for i in 0..per_thread {
-                        db.set(format!("t{t}:k{i}"), Bytes::from(format!("{t}:{i}")));
+                        db.set(format!("t{t}:k{i}"), Bytes::from(format!("{t}:{i}")))
+                            .unwrap();
                     }
                 });
             }
@@ -76,7 +77,7 @@ fn no_torn_values_on_contended_keys() {
     for kind in KINDS {
         let db = Db::new(kind);
         for k in 0..KEYS {
-            db.set(format!("hot{k}"), homogeneous(0, LEN));
+            db.set(format!("hot{k}"), homogeneous(0, LEN)).unwrap();
         }
         let stop = AtomicBool::new(false);
         thread::scope(|s| {
@@ -87,7 +88,8 @@ fn no_torn_values_on_contended_keys() {
                 s.spawn(move || {
                     let mut i = 0usize;
                     while !stop.load(Ordering::Relaxed) {
-                        db.set(format!("hot{}", i % KEYS), homogeneous(t as u8 + 1, LEN));
+                        db.set(format!("hot{}", i % KEYS), homogeneous(t as u8 + 1, LEN))
+                            .unwrap();
                         i += 1;
                     }
                 });
@@ -123,11 +125,11 @@ fn read_your_writes_and_deletes_under_contention() {
                     for round in 0..2_000 {
                         let key = format!("k{}:{t}", round % 4);
                         let val = Bytes::from(format!("{t}/{round}"));
-                        db.set(key.clone(), val.clone());
+                        db.set(key.clone(), val.clone()).unwrap();
                         assert_eq!(db.get(&key), Some(val), "{kind:?}: lost own write");
-                        assert!(db.del(&key), "{kind:?}: own key missing on DEL");
+                        assert!(db.del(&key).unwrap(), "{kind:?}: own key missing on DEL");
                         assert_eq!(db.get(&key), None, "{kind:?}: DEL not visible");
-                        assert!(!db.del(&key), "{kind:?}: double DEL succeeded");
+                        assert!(!db.del(&key).unwrap(), "{kind:?}: double DEL succeeded");
                     }
                 });
             }
@@ -140,9 +142,9 @@ fn db_clones_share_one_store() {
     for kind in KINDS {
         let a = Db::new(kind);
         let b = a.clone();
-        a.set("x".into(), Bytes::from_static(b"1"));
+        a.set("x".into(), Bytes::from_static(b"1")).unwrap();
         assert_eq!(b.get("x").as_deref(), Some(&b"1"[..]));
-        assert!(b.del("x"));
+        assert!(b.del("x").unwrap());
         assert_eq!(a.get("x"), None);
         // A fresh Db is independent.
         assert_eq!(Db::new(kind).get("x"), None);
