@@ -82,7 +82,7 @@ cargo run --release                                   # start a server
 cargo run --release --manifest-path gui/Cargo.toml    # then the GUI
 ```
 
-On Windows, `.un.ps1` does both: it builds, starts the server, opens the GUI,
+On Windows, `.\run.ps1` does both: it builds, starts the server, opens the GUI,
 and stops the server when you close the window. It takes the server's options
 (`-Addr`, `-Store`, `-Wal`, `-Fsync`), and `-NoGui` runs the server alone.
 
