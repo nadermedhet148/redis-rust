@@ -115,7 +115,7 @@ impl App {
         let mut app = Self {
             client: Client::spawn(cc.egui_ctx.clone()),
             conn: ConnState::Disconnected,
-            addr: DEFAULT_ADDR.into(),
+            addr: std::env::var("RKV_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.into()),
             status: String::new(),
             key: String::new(),
             value: String::new(),
