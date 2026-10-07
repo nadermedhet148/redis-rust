@@ -1,0 +1,10 @@
+[package]
+name = "rkv-gui"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate (not part of the rkv build) so the server stays dependency-light.
+# Run with: cargo run --release --manifest-path gui/Cargo.toml
+
+[dependencies]
+eframe = "0.36.2"

@@ -72,6 +72,20 @@ The protocol is one text command per line, so any TCP tool works:
 On Linux/macOS use `nc 127.0.0.1 6380`. On Windows use `ncat` (from Nmap), WSL,
 or Git Bash's `/dev/tcp` (see `scripts/crash-demo.sh` for an example).
 
+### Desktop GUI
+
+`gui/` is a separate crate (egui), so the server keeps its small dependency list.
+It talks to a running server over the same protocol:
+
+```sh
+cargo run --release                                   # start a server
+cargo run --release --manifest-path gui/Cargo.toml    # then the GUI
+```
+
+The GUI has GET/SET/DEL buttons, a raw command console with per-request latency,
+a table of the keys the window has touched (the server has no `KEYS` command),
+and a sequential round-trip benchmark.
+
 ## Tests and benchmarks
 
 ```sh
@@ -107,6 +121,7 @@ src/bin/        rkv-bench load generator
 benches/        criterion in-memory benchmark
 tests/          integration tests: server, concurrency, memory, cpu, crash
 scripts/        crash demo, test report
+gui/            desktop client (separate crate)
 docs/           architecture and performance write-ups
 results/        saved test/benchmark reports per episode
 ```
