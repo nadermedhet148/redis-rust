@@ -54,6 +54,7 @@ fn execute(line: &str, db: &Db) -> Vec<u8> {
             Ok(false) => b"0".to_vec(),
             Err(e) => storage_error(e),
         },
+        Ok(_) => b"ERR not implemented yet".to_vec(),
         Err(e) => format!("ERR {e}").into_bytes(),
     }
 }
