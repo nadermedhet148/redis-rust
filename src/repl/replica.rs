@@ -15,7 +15,10 @@ use crate::db::Db;
 
 /// No data and no heartbeat for this long: the leader is considered gone.
 pub const LEADER_TIMEOUT: Duration = Duration::from_secs(5);
-const ACK_EVERY: Duration = Duration::from_secs(1);
+/// ACK at most this often while records are arriving...
+const ACK_BUSY: Duration = Duration::from_millis(100);
+/// ...and at least this often when idle, so the leader knows we're alive.
+const ACK_IDLE: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,10 +160,15 @@ async fn sync_once(db: &Db, status: &Arc<Status>) -> anyhow::Result<()> {
     let _acks = AbortOnDrop(tokio::spawn({
         let status = status.clone();
         async move {
-            let mut tick = tokio::time::interval(ACK_EVERY);
+            let mut tick = tokio::time::interval(ACK_BUSY);
+            let mut last = (u64::MAX, tokio::time::Instant::now());
             loop {
                 tick.tick().await;
                 let offset = status.progress().offset;
+                if offset == last.0 && last.1.elapsed() < ACK_IDLE {
+                    continue;
+                }
+                last = (offset, tokio::time::Instant::now());
                 if writer
                     .write_all(format!("ACK {offset}\n").as_bytes())
                     .await
