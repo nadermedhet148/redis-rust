@@ -6,7 +6,7 @@ failover works, and how backups are taken and restored.
 
 For the single-node design (request path, stores, WAL), see
 [ARCHITECTURE.md](ARCHITECTURE.md). For measurements, see
-[PERFORMANCE.md](PERFORMANCE.md#8-replication-ep04).
+[PERFORMANCE.md](PERFORMANCE.md#7-replication-ep04).
 
 ---
 

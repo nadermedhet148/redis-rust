@@ -1,7 +1,7 @@
 # rkv — Performance & Safety
 
 This document covers how rkv is measured and tested for **throughput, CPU, memory,
-concurrency safety, and durability**, and what the numbers mean.
+concurrency safety, durability, and replication**, and what the numbers mean.
 For how the system itself works, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 The raw output for each episode, with every test result and benchmark table, is
@@ -15,6 +15,7 @@ scripts/test-report.sh                                # all tests + benchmarks -
 cargo test --release                                  # all safety / memory / CPU / crash tests
 cargo test --release -- --nocapture                   # same, printing the measured numbers
 cargo build --release && target/release/rkv-bench --compare stores   # TCP benchmark table
+target/release/rkv-bench --compare replicas           # replication cost + catch-up time
 cargo bench --bench store                             # in-memory lock benchmark (criterion)
 ```
 
@@ -266,7 +267,69 @@ by hand and shows replay truncating it.
 
 ---
 
-## 7. Running it yourself
+## 7. Replication (ep04)
+
+How it works: [REPLICATION.md](REPLICATION.md). This section covers what it
+costs and how it's tested.
+
+### Cost — `rkv-bench --compare replicas`
+
+A sharded leader with 0, 1 and 2 replicas (each its own process), 50 clients ×
+20,000 ops, 80% GET / 20% SET, from `results/ep04.md`:
+
+| replicas | ops/sec | p50 (µs) | p99 (µs) | leader CPU (cores) | CPU µs/op | catch-up (ms) |
+|---------:|--------:|---------:|---------:|-------------------:|----------:|--------------:|
+|        0 |   94825 |      419 |     1976 |               4.01 |      42.2 |             - |
+|        1 |   98121 |      418 |     1728 |               4.55 |      46.4 |           5.1 |
+|        2 |  114545 |      385 |     1145 |               5.01 |      43.7 |          10.6 |
+
+*Catch-up* is the time from the end of the load until every replica's `DIGEST`
+equals the leader's.
+
+- **Client throughput doesn't change measurably.** The leader acknowledges
+  before replicating, so clients never wait for replicas. The differences
+  between rows are run-to-run noise: on this run's machine state, TCP numbers
+  moved ±20% (the same `stores` table gave ~140k ops/s at ep03 and ~90k here).
+- **The cost is on the leader's CPU**: one encode per write (shared with the
+  WAL when that's on), one backlog push under a mutex, and one sender task per
+  replica that copies 64 KiB chunks to a socket. That's a few µs per op out of
+  ~42, which TCP overhead hides.
+- **Replicas are 5–11 ms behind** when the load stops, at ~20k writes/s. While
+  the load runs, `scripts/repl-demo.sh` sees **~0.5–1% stale reads** when it
+  does a write on the leader and an immediate read on a replica.
+- **The backlog is a single mutex for all shards.** With replicas attached,
+  sharded writes serialize on it (just as they do on the WAL mutex). It's held
+  only for a `memcpy` of the record, so it doesn't show up over TCP. It would
+  in an in-memory benchmark.
+
+### Correctness — `tests/replication.rs`, `tests/backup.rs`
+
+The full list of tests and the claim each one checks is in
+[REPLICATION.md §10](REPLICATION.md#10-code-map-and-tests). The two that matter
+most:
+
+- **`replica_attached_under_load_converges_on_every_store`**: 20 clients write
+  and delete while a replica attaches, so the snapshot is copied shard by shard
+  while keys change. Once the load stops, the replica's `DIGEST` must equal the
+  leader's, for every store kind.
+- **`backup_taken_under_load_is_a_consistent_point_in_time`**: writers update
+  pairs `(a_i, b_i)` in order while a backup runs over 200k filler keys (so the
+  copy takes milliseconds). Every restored pair must be a state that actually
+  existed (`a == b` or `a == b + 1`). **This test was checked against a
+  deliberately broken `rkv-backup`** (no replay up to `consistent_at`). It
+  failed every time, with pairs like `a=137 b=153`, so it really detects
+  inconsistent snapshots.
+
+Network failures are injected with a TCP proxy in the test that can cut every
+connection, refuse reconnects, or forward to a different leader.
+
+**What these tests can't show:** real network partitions with packet loss
+or delay, and leaders on different machines. Lag on a real network is at least
+one RTT, plus however long a burst takes to cross the link.
+
+---
+
+## 8. Running it yourself
 
 ```sh
 # everything, saved to results/<git describe>.md
@@ -281,12 +344,16 @@ cargo test --release --test concurrency
 cargo test --release --test memory -- --nocapture
 cargo test --release --test cpu -- --nocapture
 cargo test --release --test crash -- --nocapture
+cargo test --release --test replication
+cargo test --release --test backup
 cargo test --release --lib wal                           # WAL format unit tests
+cargo test --release --lib repl                          # backlog + stream unit tests
 
 # benchmarks
 cargo build --release
 target/release/rkv-bench --compare stores                # 50 clients x 20k ops, 80% reads
 target/release/rkv-bench --compare fsync -n 2000         # WAL fsync policies
+target/release/rkv-bench --compare replicas              # leader with 0 / 1 / 2 replicas
 target/release/rkv-bench --compare stores -c 100 -n 5000 --read-ratio 0.5
 target/release/rkv-bench --addr 127.0.0.1:6380           # against a server you started
 cargo bench --bench store                                # criterion; HTML in target/criterion/
