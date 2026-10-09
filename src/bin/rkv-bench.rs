@@ -8,6 +8,7 @@
 //!   cargo build --release
 //!   target/release/rkv-bench --compare stores   # mutex vs rwlock vs sharded (ep02)
 //!   target/release/rkv-bench --compare fsync    # no WAL vs fsync never/every-sec/always (ep03)
+//!   target/release/rkv-bench --compare replicas # leader with 0 / 1 / 2 replicas (ep04)
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -51,6 +52,8 @@ enum Compare {
     Stores,
     /// --store sharded with no WAL, then WAL with each --fsync policy
     Fsync,
+    /// a sharded leader with 0, 1 and 2 replicas: throughput and catch-up time
+    Replicas,
 }
 
 /// One row of a comparison: a label and the extra args for `rkv`.
@@ -130,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
+    if let Compare::Replicas = compare {
+        return compare_replicas(&args).await;
+    }
     let configs = match compare {
         Compare::Stores => vec![
             Config::new("mutex", "mutex", None),
@@ -142,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             Config::new("every-sec", "sharded", Some("every-sec")),
             Config::new("always", "sharded", Some("always")),
         ],
+        Compare::Replicas => unreachable!(),
     };
 
     println!(
@@ -177,6 +184,82 @@ async fn main() -> anyhow::Result<()> {
             mb(idle_rss),
             mb(peak_rss),
         );
+    }
+    Ok(())
+}
+
+/// Load the leader, then measure how long the replicas take to have exactly
+/// the leader's data (same DIGEST) once the load stops. Replication is
+/// asynchronous, so clients never wait for replicas: the cost shows up as
+/// leader CPU (one stream per replica) and as catch-up time.
+async fn compare_replicas(args: &Args) -> anyhow::Result<()> {
+    println!(
+        "| replicas | ops/sec | p50 (us) | p99 (us) | leader CPU (cores) | CPU us/op | catch-up (ms) |"
+    );
+    println!(
+        "|---------:|--------:|---------:|---------:|-------------------:|----------:|--------------:|"
+    );
+    for (i, n) in [0usize, 1, 2].into_iter().enumerate() {
+        let leader_addr = format!("127.0.0.1:{}", 16480 + i * 10);
+        let store = ["--store".to_string(), "sharded".to_string()];
+        let leader = Server::spawn(&leader_addr, &store).await?;
+        let mut replicas = Vec::new();
+        for r in 0..n {
+            let addr = format!("127.0.0.1:{}", 16481 + i * 10 + r);
+            let mut replica_args = store.to_vec();
+            replica_args.extend(["--replica-of".to_string(), leader_addr.clone()]);
+            replicas.push((addr.clone(), Server::spawn(&addr, &replica_args).await?));
+        }
+        let mut ctl = Conn::connect(&leader_addr).await?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ctl
+            .request("ROLE")
+            .await?
+            .contains(&format!("replicas={n}"))
+        {
+            anyhow::ensure!(Instant::now() < deadline, "replicas did not connect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let args = Args {
+            addr: leader_addr.clone(),
+            ..args.clone()
+        };
+        preload(&args).await?;
+        let cpu_before = leader.cpu_ms();
+        let report = run(&args).await?;
+        let cpu_ms = leader.cpu_ms() - cpu_before;
+
+        let caught_up = Instant::now();
+        let digest = ctl.request("DIGEST").await?;
+        for (addr, _) in &replicas {
+            let mut conn = Conn::connect(addr).await?;
+            while conn.request("DIGEST").await? != digest {
+                anyhow::ensure!(
+                    caught_up.elapsed() < Duration::from_secs(30),
+                    "replica never caught up"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let catch_up = if n == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.1}", caught_up.elapsed().as_secs_f64() * 1000.0)
+        };
+
+        println!(
+            "| {:>8} | {:>7.0} | {:>8} | {:>8} | {:>18.2} | {:>9.1} | {:>13} |",
+            n,
+            report.ops_per_sec(),
+            report.percentile(0.50),
+            report.percentile(0.99),
+            cpu_ms as f64 / report.elapsed.as_millis() as f64,
+            cpu_ms as f64 * 1000.0 / report.total_ops as f64,
+            catch_up,
+        );
+        drop(replicas);
+        drop(leader);
     }
     Ok(())
 }
