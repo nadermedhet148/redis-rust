@@ -14,6 +14,9 @@
 //! Each record goes to the OS in a single `write` call, so a record the server
 //! acknowledged survives the *process* dying (kill -9) under every policy.
 //! `FsyncPolicy` only decides what survives the *machine* dying (power loss).
+//!
+//! The record codec is public: the replication stream (`repl`) and backup files
+//! (`rkv-backup`) use exactly this format, so a backup file is a valid WAL.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -25,11 +28,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{info, warn};
 
-const HEADER_LEN: usize = 8;
+pub const HEADER_LEN: usize = 8;
 const OP_SET: u8 = 1;
 const OP_DEL: u8 = 2;
 /// Upper bound on one record, so a corrupted length can't make replay allocate gigabytes.
-const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
+pub const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 
 /// When the log is fsynced to the disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -127,14 +130,15 @@ impl Wal {
     }
 
     pub fn append_set(&self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.append(&encode(OP_SET, key, value))
+        self.append(&encode_set(key, value))
     }
 
     pub fn append_del(&self, key: &str) -> io::Result<()> {
-        self.append(&encode(OP_DEL, key, &[]))
+        self.append(&encode_del(key))
     }
 
-    fn append(&self, record: &[u8]) -> io::Result<()> {
+    /// Append an already-encoded record (from `encode_set` / `encode_del`).
+    pub fn append(&self, record: &[u8]) -> io::Result<()> {
         let mut file = self.shared.file.lock().unwrap();
         // One write call per record: once it returns, the record is in the OS
         // page cache and survives this process crashing.
@@ -170,6 +174,21 @@ fn spawn_syncer(shared: Weak<Shared>) {
         .expect("failed to spawn wal-fsync thread");
 }
 
+pub fn encode_set(key: &str, value: &[u8]) -> Vec<u8> {
+    encode(OP_SET, key, value)
+}
+
+pub fn encode_del(key: &str) -> Vec<u8> {
+    encode(OP_DEL, key, &[])
+}
+
+pub fn encode_record(record: &Record) -> Vec<u8> {
+    match record {
+        Record::Set { key, value } => encode_set(key, value),
+        Record::Del { key } => encode_del(key),
+    }
+}
+
 fn encode(op: u8, key: &str, value: &[u8]) -> Vec<u8> {
     let payload_len = 1 + 4 + key.len() + value.len();
     let mut buf = Vec::with_capacity(HEADER_LEN + payload_len);
@@ -184,24 +203,38 @@ fn encode(op: u8, key: &str, value: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Read one record. `Ok(None)` means "end of the valid log": a clean EOF, a
-/// record cut short, a CRC mismatch, or a payload that doesn't decode.
-/// `Err` is only for real I/O errors.
-fn read_record(r: &mut impl Read) -> io::Result<Option<(Record, u64)>> {
+/// Read one record and its size in bytes. `Ok(None)` means "end of the valid
+/// log": a clean EOF, a record cut short, a CRC mismatch, or a payload that
+/// doesn't decode. `Err` is only for real I/O errors.
+pub fn read_record(r: &mut impl Read) -> io::Result<Option<(Record, u64)>> {
     let mut header = [0u8; HEADER_LEN];
     if !read_full(r, &mut header)? {
         return Ok(None);
     }
+    let Some((len, crc)) = parse_header(&header) else {
+        return Ok(None);
+    };
+    let mut payload = vec![0u8; len];
+    if !read_full(r, &mut payload)? {
+        return Ok(None);
+    }
+    Ok(decode_payload(payload, crc).map(|rec| (rec, (HEADER_LEN + len) as u64)))
+}
+
+/// `(payload length, crc)` from a record header, or `None` if the length is
+/// implausible (corruption).
+pub fn parse_header(header: &[u8; HEADER_LEN]) -> Option<(usize, u32)> {
     let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    if len > MAX_RECORD_LEN {
-        return Ok(None);
+    (len <= MAX_RECORD_LEN).then_some((len as usize, crc))
+}
+
+/// Check the payload against its CRC and decode it.
+pub fn decode_payload(payload: Vec<u8>, crc: u32) -> Option<Record> {
+    if crc32fast::hash(&payload) != crc {
+        return None;
     }
-    let mut payload = vec![0u8; len as usize];
-    if !read_full(r, &mut payload)? || crc32fast::hash(&payload) != crc {
-        return Ok(None);
-    }
-    Ok(decode(payload).map(|rec| (rec, (HEADER_LEN + len as usize) as u64)))
+    decode(payload)
 }
 
 /// Like `read_exact`, but a short read returns `Ok(false)` instead of an error.
