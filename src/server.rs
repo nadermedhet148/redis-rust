@@ -1,19 +1,28 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::command::Command;
 use crate::db::Db;
+use crate::repl::{Node, leader};
 
-/// Accept connections forever, one task per client.
+/// Accept connections forever, one task per client. A standalone leader.
 pub async fn run(listener: TcpListener, db: Db) -> anyhow::Result<()> {
+    serve(listener, Node::new(db)).await
+}
+
+/// Like `run`, for a node the caller set up (a replica, a custom backlog size...).
+pub async fn serve(listener: TcpListener, node: Arc<Node>) -> anyhow::Result<()> {
     info!(addr = %listener.local_addr()?, "listening");
     loop {
         let (socket, peer) = listener.accept().await?;
-        let db = db.clone();
+        let node = node.clone();
         tokio::spawn(async move {
             debug!(%peer, "client connected");
-            if let Err(e) = handle_client(socket, db).await {
+            if let Err(e) = handle_client(socket, peer, node).await {
                 warn!(%peer, error = %e, "connection error");
             }
             debug!(%peer, "client disconnected");
@@ -21,7 +30,7 @@ pub async fn run(listener: TcpListener, db: Db) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_client(socket: TcpStream, db: Db) -> anyhow::Result<()> {
+async fn handle_client(socket: TcpStream, peer: SocketAddr, node: Arc<Node>) -> anyhow::Result<()> {
     // Small request/response messages: don't let Nagle hold replies back.
     socket.set_nodelay(true)?;
     let (reader, mut writer) = socket.into_split();
@@ -31,7 +40,11 @@ async fn handle_client(socket: TcpStream, db: Db) -> anyhow::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let mut reply = execute(&line, &db);
+        if let Ok(Command::Sync { replid, offset }) = Command::parse(&line) {
+            // From here on this connection is a replication stream.
+            return leader::serve(node, lines, writer, peer, replid, offset).await;
+        }
+        let mut reply = execute(&line, &node.db);
         reply.push(b'\n');
         writer.write_all(&reply).await?;
     }
