@@ -44,15 +44,19 @@ async fn handle_client(socket: TcpStream, peer: SocketAddr, node: Arc<Node>) -> 
             // From here on this connection is a replication stream.
             return leader::serve(node, lines, writer, peer, replid, offset).await;
         }
-        let mut reply = execute(&line, &node.db);
+        let mut reply = execute(&line, &node);
         reply.push(b'\n');
         writer.write_all(&reply).await?;
     }
     Ok(())
 }
 
-fn execute(line: &str, db: &Db) -> Vec<u8> {
+fn execute(line: &str, node: &Node) -> Vec<u8> {
+    let db = &node.db;
     match Command::parse(line) {
+        Ok(Command::Set { .. } | Command::Del { .. }) if node.is_read_only() => {
+            b"ERR READONLY this node is a replica; send writes to the leader".to_vec()
+        }
         Ok(Command::Ping) => b"PONG".to_vec(),
         Ok(Command::Get { key }) => match db.get(&key) {
             Some(value) => value.to_vec(),
@@ -69,6 +73,7 @@ fn execute(line: &str, db: &Db) -> Vec<u8> {
         },
         Ok(Command::DbSize) => db.len().to_string().into_bytes(),
         Ok(Command::Digest) => format!("{:016x}", db.digest()).into_bytes(),
+        Ok(Command::Role) => node.describe().into_bytes(),
         Ok(_) => b"ERR not implemented yet".to_vec(),
         Err(e) => format!("ERR {e}").into_bytes(),
     }
