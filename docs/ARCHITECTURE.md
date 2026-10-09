@@ -1,10 +1,12 @@
 # How rkv works
 
-This is a walkthrough of the system as of tag `ep03`: what happens to a request
-from the moment it arrives on a socket until it is in memory and on disk, and
-how the server rebuilds its state after a crash.
+This is a walkthrough of a single rkv node as of tag `ep04`: what happens to a
+request from the moment it arrives on a socket until it is in memory and on
+disk, and how the server rebuilds its state after a crash.
 
-For how it's measured and tested, see [PERFORMANCE.md](PERFORMANCE.md).
+Copying data between nodes (leader → replicas, failover, backups) has its own
+document: [REPLICATION.md](REPLICATION.md). For how it's measured and tested,
+see [PERFORMANCE.md](PERFORMANCE.md).
 
 ---
 
@@ -35,8 +37,10 @@ flowchart LR
 | Server | `src/server.rs` | Accept TCP connections; one tokio task per client reads lines, executes them, writes replies. |
 | Protocol | `src/command.rs` | Turn one text line into a `Command` (`PING` / `GET` / `SET` / `DEL`) or a `ParseError`. |
 | Storage | `src/db.rs` | `Db`: a cheaply clonable handle to the in-memory map(s) plus the optional WAL. |
-| Durability | `src/wal.rs` | Append records to the log, fsync by policy, replay and repair the log on startup. |
+| Durability | `src/wal.rs` | Append records to the log, fsync by policy, replay and repair the log on startup. Its record codec is also the replication and backup format. |
+| Replication | `src/repl/` | `Node` (role, replid), the backlog, the leader and replica sides of the stream. See [REPLICATION.md](REPLICATION.md). |
 | Benchmark | `src/bin/rkv-bench.rs` | Load generator; can spawn and compare server configurations. |
+| Backup | `src/bin/rkv-backup.rs` | Takes a consistent backup over the replication protocol; verifies backup files. |
 
 ---
 
@@ -51,6 +55,12 @@ talk to the server with `nc` (or bash's `/dev/tcp`) and read everything on the w
 | `SET <key> <value...>` | `OK` | The value is **the rest of the line**, so spaces are kept. |
 | `GET <key>` | the value, or `(nil)` | |
 | `DEL <key>` | `1` if it existed, else `0` | |
+| `DBSIZE` | number of keys | |
+| `DIGEST` | 16 hex digits | Order-independent hash of all data: equal on two nodes ⇔ same data. |
+| `ROLE` | `leader …` or `replica …` | One line of `key=value` fields ([REPLICATION.md §2](REPLICATION.md#2-commands)). |
+| `REPLICAOF <host> <port>` / `REPLICAOF NO ONE` | `OK` | Become a replica / promote to leader. |
+| `SET` / `DEL` on a replica | `ERR READONLY …` | |
+| `SYNC …` | *(the connection becomes a replication stream)* | Sent by replicas and `rkv-backup`. |
 | anything else | `ERR <reason>` | e.g. `ERR unknown command 'FOO'`, `ERR wrong number of arguments for 'GET'` |
 | write that couldn't be logged | `ERR storage: <io error>` | The write was **not** applied. |
 
@@ -263,6 +273,13 @@ flowchart TD
 `scripts/crash-demo.sh` shows all of this live: writes, `kill -9`, restart,
 data back, then a hand-made torn record being detected and cut off.
 
+### The same record, three uses
+
+Since ep04 the encoded record is built once per write, under the key's lock,
+and goes to the WAL file and (when a replica is attached) to the replication
+backlog. The same format is used for snapshots sent to replicas and for backup
+files. That's why `rkv --wal backup.rkv` restores a backup.
+
 ### Known limits of the current WAL
 
 - **The log grows forever.** Every `SET` is appended, even overwrites of the same
@@ -282,7 +299,9 @@ data back, then a hand-made torn record being detected and cut off.
 | accept loop | one tokio task | the listener | owned by that task |
 | connection handler | one tokio task per client | `Db` (clone of an `Arc`) | locks inside `Db` |
 | `GET` | the caller's task | one map | read lock (shared) |
-| `SET` / `DEL` | the caller's task | one map + the WAL file | write lock on the map, then the WAL mutex |
+| `SET` / `DEL` | the caller's task | one map + the WAL file + the backlog | write lock on the map, then the WAL mutex, then the backlog mutex |
+| replica stream (leader side) | one tokio task per replica | the backlog | backlog mutex while copying a chunk; waits on a `watch` channel |
+| replication (replica side) | one tokio task + an ACK task | `Db` | same `Db` path as client writes |
 | WAL fsync (`every-sec`) | a dedicated OS thread | the WAL file | WAL mutex + `dirty` flag |
 
 Locks are `std::sync` locks, not `tokio::sync`. That's fine because no lock is
@@ -304,18 +323,23 @@ src/
 ├── lib.rs           module list (so tests and benches can use the crate)
 ├── server.rs        accept loop, per-connection task, execute(), replies
 ├── command.rs       Command enum + line parser (+ unit tests)
-├── db.rs            Db, StoreKind, the three stores, MapGuard, WAL hookup
+├── db.rs            Db, StoreKind, the three stores, MapGuard, WAL + backlog hookup, digest
 ├── wal.rs           record encode/decode, append + fsync, replay + truncate (+ unit tests)
-└── bin/rkv-bench.rs load generator, --compare stores|fsync
+├── repl/            replication: Node, backlog, stream framing, leader side, replica side
+├── bin/rkv-bench.rs load generator, --compare stores|fsync|replicas
+└── bin/rkv-backup.rs snapshot | follow | verify
 benches/store.rs     criterion: T threads hammering Db in memory
 tests/
 ├── server.rs        basic protocol over TCP
 ├── concurrency.rs   lost writes, torn values, read-your-writes, deadlock (all stores)
 ├── memory.rs        counting allocator: per-key overhead, leaks, connections
 ├── cpu.rs           idle CPU, CPU per request
-└── crash.rs         kill -9 the real binary, restart, check acknowledged writes
+├── crash.rs         kill -9 the real binary, restart, check acknowledged writes
+├── replication.rs   leader/replica: convergence, partial/full resync, failover (via a TCP proxy)
+└── backup.rs        rkv-backup: restore, consistency under load, torn tail, follow
 scripts/
 ├── crash-demo.sh    ep03 live demo
+├── repl-demo.sh     ep04 live demo
 └── test-report.sh   all tests + benchmarks → results/<tag>.md
 ```
 
@@ -325,7 +349,7 @@ scripts/
 
 | Episode | Change | Effect on this design |
 |---------|--------|-----------------------|
-| ep04 | `Storage` trait; memtable (`BTreeMap`) flushed to SSTables; tombstones; compaction | The WAL only has to cover the memtable and gets truncated after each flush. Reads check the memtable, then SSTables newest first. |
-| ep05 | Leader ships WAL entries with sequence numbers to followers | The WAL record becomes the replication unit; followers can serve stale reads. |
+| ep04 ✅ | Leader → replica replication, manual failover, `rkv-backup` | Done: see [REPLICATION.md](REPLICATION.md). |
+| ep05 | `Storage` trait; memtable (`BTreeMap`) flushed to SSTables; tombstones; compaction | The WAL only has to cover the memtable and gets truncated after each flush. Reads check the memtable, then SSTables newest first. Full syncs already snapshot from memory, so replication is unaffected. |
 | ep06 | Raft roles, terms, randomized election timeouts, `RequestVote` | Automatic leader failover in under 2 s. |
 | ep07 | `AppendEntries`, commit index; the storage engine becomes Raft's state machine | A write is acknowledged only once a majority has it, so killing nodes loses no acknowledged write. |
