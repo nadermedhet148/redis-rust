@@ -74,7 +74,21 @@ fn execute(line: &str, node: &Node) -> Vec<u8> {
         Ok(Command::DbSize) => db.len().to_string().into_bytes(),
         Ok(Command::Digest) => format!("{:016x}", db.digest()).into_bytes(),
         Ok(Command::Role) => node.describe().into_bytes(),
-        Ok(_) => b"ERR not implemented yet".to_vec(),
+        Ok(Command::ReplicaOf {
+            leader: Some(leader),
+        }) => {
+            info!(%leader, "REPLICAOF: becoming a replica");
+            node.replicate_from(leader);
+            b"OK".to_vec()
+        }
+        Ok(Command::ReplicaOf { leader: None }) => {
+            info!("REPLICAOF NO ONE: promoted to leader");
+            node.promote();
+            b"OK".to_vec()
+        }
+        Ok(Command::Ack { .. }) => b"ERR ACK is only valid on a replication stream".to_vec(),
+        // Handled in handle_client: it takes over the connection.
+        Ok(Command::Sync { .. }) => unreachable!("SYNC is handled before execute"),
         Err(e) => format!("ERR {e}").into_bytes(),
     }
 }
