@@ -40,6 +40,8 @@ echo "benchmarking stores..."
 stores="$("$bench" --compare stores -c 50 -n 20000 2>&1)"
 echo "benchmarking fsync policies..."
 fsync="$("$bench" --compare fsync -c 50 -n 2000 2>&1)"
+echo "benchmarking replication..."
+replicas="$("$bench" --compare replicas -c 50 -n 20000 2>&1)"
 
 criterion=""
 if [[ "${CRITERION:-0}" == 1 ]]; then
@@ -71,6 +73,12 @@ cpu="$(powershell.exe -NoProfile -Command '(Get-CimInstance Win32_Processor).Nam
   echo "## Benchmark: WAL fsync policies over TCP (sharded store)"
   echo
   echo "$fsync"
+  echo
+  echo "## Benchmark: leader with 0 / 1 / 2 replicas over TCP (sharded store)"
+  echo
+  echo "Catch-up = time from the end of the load until every replica's DIGEST equals the leader's."
+  echo
+  echo "$replicas"
   echo
   if [[ -n "$criterion" ]]; then
     echo "## Benchmark: in-memory stores (criterion, million ops/sec = Melem/s)"
