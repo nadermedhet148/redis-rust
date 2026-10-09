@@ -54,6 +54,8 @@ fn execute(line: &str, db: &Db) -> Vec<u8> {
             Ok(false) => b"0".to_vec(),
             Err(e) => storage_error(e),
         },
+        Ok(Command::DbSize) => db.len().to_string().into_bytes(),
+        Ok(Command::Digest) => format!("{:016x}", db.digest()).into_bytes(),
         Ok(_) => b"ERR not implemented yet".to_vec(),
         Err(e) => format!("ERR {e}").into_bytes(),
     }
