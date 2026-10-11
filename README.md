@@ -130,6 +130,7 @@ Some numbers from `ep03` (Core Ultra 9 275HX, loopback; full reports in [`result
 
 ## Documentation
 
+- **[docs/CONCURRENCY.md](docs/CONCURRENCY.md)**: concurrency architectures in rkv. Details the three store locking strategies, hardware cache contention (MESI), the Tokio per-connection async server model, lock hierarchy, and safety guarantees.
 - **[docs/REPLICATION.md](docs/REPLICATION.md)**: how data gets copied between nodes. It covers the leader → replica flow, offsets and the backlog, full vs partial resync, why a fuzzy snapshot is correct, what each failure does, manual failover, and backups and restores.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: how a single node works. It covers the request lifecycle, the three store designs, the WAL format, write ordering, crash recovery, and the concurrency model.
 - **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)**: how it's measured. It covers the benchmarks, what every test asserts and why, and what the measurements turned up.

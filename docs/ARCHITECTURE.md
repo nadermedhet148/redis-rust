@@ -313,6 +313,8 @@ lost writes, no torn values (a `GET` never returns half of one write and half of
 another), read-your-writes per connection, and no deadlocks under 100 concurrent
 clients.
 
+For an exhaustive guide covering in-memory cache bouncing (MESI), Criterion benchmarks, and lock hierarchy design, see **[CONCURRENCY.md](CONCURRENCY.md)**.
+
 ---
 
 ## 7. Code map
