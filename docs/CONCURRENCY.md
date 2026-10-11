@@ -48,7 +48,26 @@ flowchart TB
 
 ## 2. In-Memory Storage Concurrency (`StoreKind`)
 
-All key-value data lives in `HashMap<String, Bytes>`. How threads access this data is configured by `--store <mutex|rwlock|sharded>` (defined in [`src/db.rs`](../src/db.rs)):
+All key-value data lives in `HashMap<String, Bytes>`. How threads access this data is configured by `--store <mutex|rwlock|sharded>` (defined in [`src/db.rs`](../src/db.rs)).
+
+### Internal Type Architecture
+
+To avoid duplicating the write and durability paths across all three strategies, [`Db`](../src/db.rs) wraps an internal [`Inner`](../src/db.rs) enum behind an `Arc<Shared>`:
+
+```rust
+enum Inner {
+    Mutex(Mutex<Map>),
+    RwLock(RwLock<Map>),
+    Sharded(Sharded),
+}
+
+enum MapGuard<'a> {
+    Mutex(MutexGuard<'a, Map>),
+    RwLock(RwLockWriteGuard<'a, Map>),
+}
+```
+
+The method `inner.write_map(key)` acquires the appropriate exclusive lock and returns a `MapGuard`, allowing `set()` and `del()` logic (including WAL logging and replication backlog pushes) to be written once for all three locking strategies.
 
 ```mermaid
 flowchart LR
@@ -72,41 +91,96 @@ flowchart LR
     end
 ```
 
+---
+
 ### Strategy A: Global Mutex (`StoreKind::Mutex`)
 
-- **Implementation:** `Arc<Mutex<HashMap<String, Bytes>>>`
-- **Behavior:** Every operation (`GET`, `SET`, `DEL`), including read-only lookups, acquires an exclusive lock.
-- **Characteristics:**
-  - Zero lock management overhead.
-  - No reader-writer starvation concerns.
-  - All threads queue up sequentially. On multi-core CPUs under concurrent load, throughput collapses because threads spend their time blocked waiting for the single mutex.
+#### Mental Model: **A single room with a single key**
+Everyone waits in a single queue outside the door. Only one thread can enter the room at a time, regardless of whether it is just reading a key or modifying it.
+
+```text
+Thread 1 (GET "user:1")  ──┐
+Thread 2 (GET "user:2")  ──┼──> [ Mutex<HashMap> ] ──> Only 1 runs at a time
+Thread 3 (SET "user:3")  ──┘
+```
+
+#### Mechanics:
+- **Backing Structure:** `std::sync::Mutex<HashMap<String, Bytes>>`.
+- **How Reads Work (`GET`):** Calls `m.lock().unwrap()`. It acquires an **exclusive lock**. Even though it only reads, all other reader and writer threads are blocked.
+- **How Writes Work (`SET` / `DEL`):** Calls `write_map()` which acquires `m.lock().unwrap()`. It logs to the WAL while holding the lock, updates or removes the entry, and unlocks.
+- **Trade-offs:**
+  - **Pros:** Simplest implementation, zero overhead on a single core, no reader-writer starvation risks.
+  - **Cons:** Under multi-core parallel traffic, threads contend on a single lock. In memory, scaling collapses from ~15M ops/s on 1 thread down to **~4–5M ops/s** on 4+ threads.
+
+---
 
 ### Strategy B: Global Reader-Writer Lock (`StoreKind::RwLock`)
 
-- **Implementation:** `Arc<RwLock<HashMap<String, Bytes>>>`
-- **Behavior:** Multiple concurrent readers (`GET`) acquire shared read locks (`read()`). Modifying operations (`SET`, `DEL`) acquire exclusive write locks (`write()`).
+#### Mental Model: **A library reading room**
+Any number of readers can sit and read simultaneously. But when someone needs to modify/renovate the room (write), all readers must exit first, and only the writer enters exclusively.
+
+```text
+Thread 1 (GET "user:1")  ──┐
+                           ├──> [ Shared Read Lock ] ──> Run in parallel!
+Thread 2 (GET "user:2")  ──┘
+                                      │
+Thread 3 (SET "user:3")  ─────────────┴──> [ Exclusive Write Lock ] ──> Waits for readers to drain
+```
+
+#### Mechanics:
+- **Backing Structure:** `std::sync::RwLock<HashMap<String, Bytes>>`.
+- **How Reads Work (`GET`):** Calls `m.read().unwrap()`. Multiple threads acquire shared read guards simultaneously without blocking each other.
+- **How Writes Work (`SET` / `DEL`):** Calls `write_map()` which acquires `m.write().unwrap()`. It waits until all active readers release their locks, then takes exclusive access to log and update the map.
 - **The Hardware Reality (Cache-Line Bouncing):**
-  - In theory, an 80% read workload should scale with multiple reader threads.
-  - In practice on multi-core systems, `std::sync::RwLock` maintains an internal atomic reader counter.
-  - Every thread executing `read()` must perform an atomic `fetch_add` / `fetch_sub` on that single counter.
-  - Under the CPU cache coherence protocol (MESI), this single 64-byte cache line is continuously invalidated and bounced across L1/L2 caches of different CPU cores.
-  - Result: High lock contention and pipeline stalls make `RwLock` **slower than `Mutex`** under high thread counts in memory.
+  - In theory, an 80% read workload should scale across multiple reader threads.
+  - In practice on multi-core CPUs, `std::sync::RwLock` maintains an internal atomic reader counter.
+  - Every thread calling `read()` executes an atomic instruction (`fetch_add`) to bump this counter, and a `fetch_sub` on release.
+  - Under the CPU cache coherence protocol (MESI), this single 64-byte cache line is continuously invalidated and bounced back and forth between L1/L2 caches of different CPU cores.
+  - Because of this cache contention, `RwLock` in memory drops to **~2.9M ops/s** at 8 threads—**slower than a single `Mutex`!**
+
+---
 
 ### Strategy C: 64-Way Hash Sharding (`StoreKind::Sharded`)
 
-- **Implementation:** A boxed slice of 64 independent `RwLock<HashMap<String, Bytes>>` shards (`DEFAULT_SHARDS = 64`).
-- **Partitioning:**
+#### Mental Model: **64 separate bank teller windows**
+Instead of one big counter, there are 64 separate windows. When you arrive with a key, the hash of that key determines which window you visit (`hash(key) % 64`). Clients visiting different windows never wait for each other.
+
+```text
+Key "user:1" ──> hash & 63 = Shard 12 ──> [ Shard 12: RwLock<Map> ]
+Key "order:5"──> hash & 63 = Shard 45 ──> [ Shard 45: RwLock<Map> ]  (Zero contention!)
+Key "item:99"──> hash & 63 = Shard 12 ──> [ Shard 12: RwLock<Map> ]  (Contends only on Shard 12)
+```
+
+#### Mechanics:
+- **Backing Structure:** A boxed slice of 64 independent `RwLock<HashMap<String, Bytes>>` shards (`DEFAULT_SHARDS = 64`):
+  ```rust
+  struct Sharded {
+      shards: Box<[RwLock<Map>]>,
+      hasher: RandomState,
+  }
+  ```
+- **Shard Partitioning:** Uses a bitwise mask because 64 is a power of two:
   ```rust
   fn shard(&self, key: &str) -> &RwLock<Map> {
       let h = self.hasher.hash_one(key) as usize;
-      &self.shards[h & (self.shards.len() - 1)]
+      &self.shards[h & (self.shards.len() - 1)] // h & 63
   }
   ```
-- **Characteristics:**
-  - Keys are distributed evenly across 64 buckets using a fast hash function (`RandomState::hash_one`).
-  - Operations touching different keys hit completely different locks and distinct CPU cache lines.
-  - Read operations within the same shard are shared; writes to different shards execute concurrently without blocking each other.
-  - Memory throughput scales almost linearly with physical performance cores.
+- **How Reads Work (`GET`):** Identifies the key's shard via its hash, and acquires a `read()` lock **only on that single shard**. The other 63 shards remain completely unblocked.
+- **How Writes Work (`SET` / `DEL`):** Calls `write_map(key)` which acquires an exclusive `write()` lock **only on that single shard**. Writes to different shards execute simultaneously.
+- **Trade-offs:**
+  - **Pros:** Near-linear scaling across CPU cores. Different threads touch different cache lines, avoiding cache thrashing. Reaches **86.5M ops/s** on 16 threads (a **21.8× speedup** over Mutex).
+  - **Cons:** On a single thread with no contention, it is ~25% slower because it hashes the key twice (once to pick the shard index, once inside the underlying `HashMap`).
+
+---
+
+### Strategy Summary Comparison
+
+| Strategy | Backing Type | Read Lock | Write Lock | In-Memory (16 threads) | Strengths & Bottlenecks |
+|---|---|---|---|:---:|---|
+| **`Mutex`** | `Mutex<Map>` | Exclusive | Exclusive | 4.0M ops/s | Simple, zero overhead on single core; high thread contention. |
+| **`Rwlock`** | `RwLock<Map>` | Shared | Exclusive | 4.0M ops/s *(2.9M at 8 threads)* | Allows parallel reads, but atomic reader counter bounces across CPU caches. |
+| **`Sharded`** | 64 × `RwLock<Map>` | Shared per-shard | Exclusive per-shard | **86.5M ops/s** | Independent cache lines; scales linearly with CPU cores. |
 
 ---
 
